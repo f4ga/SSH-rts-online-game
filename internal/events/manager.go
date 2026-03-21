@@ -2,8 +2,7 @@ package events
 
 import "ssh-arena-app/internal"
 
-// EventBus returns a stub implementation of the EventBus interface.
+// EventBus возвращает реализацию шины событий.
 func EventBus() internal.EventBus {
-	// TODO: implement
-	return nil
+	return NewEventBus()
 }
