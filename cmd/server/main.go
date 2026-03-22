@@ -9,12 +9,15 @@ import (
 	"time"
 
 	"ssh-arena-app/internal"
+	"ssh-arena-app/internal/building"
+	"ssh-arena-app/internal/citizen"
 	"ssh-arena-app/internal/combat"
 	"ssh-arena-app/internal/economy"
 	"ssh-arena-app/internal/engine"
 	"ssh-arena-app/internal/events"
 	"ssh-arena-app/internal/network"
 	"ssh-arena-app/internal/research"
+	"ssh-arena-app/internal/storage"
 	"ssh-arena-app/internal/ui"
 	"ssh-arena-app/internal/world"
 	"ssh-arena-app/pkg/config"
@@ -53,28 +56,57 @@ func main() {
 	world := world.NewWorld(seed)
 	eventBus := events.EventBus() // теперь реальная реализация
 
-	// Create managers
-	var (
-		building internal.BuildingManager = nil // TODO: implement
-		citizen  internal.CitizenManager  = nil // TODO: implement
-		combat   internal.CombatManager   = combat.NewCombatManager(world)
-		economy  internal.EconomyManager  = economy.NewEconomyManager()
-		research internal.ResearchManager = research.NewResearchManager(eventBus)
-		storage  internal.Storage         = nil
-	)
-
-	// Create network transport (SSH server)
-	networkTransport, err := network.NetworkTransport()
+	// Create storage
+	storage, err := storage.NewStorage(&cfg.Database)
 	if err != nil {
-		log.Error("Failed to create network transport", "error", err)
+		log.Error("Failed to create storage", "error", err)
 		os.Exit(1)
 	}
 
-	// Create UI renderer and viewport
-	viewport := ui.NewViewport(cfg.Game.WorldWidth, cfg.Game.WorldHeight, 80, 24)
-	renderer := ui.NewANSIRenderer(viewport, 80)
+	// Load saved game state if any
+	var loadedState *internal.GameState
+	if storage != nil {
+		loadedState, err = storage.LoadGame("default")
+		if err != nil {
+			log.Warn("Failed to load game state", "error", err)
+		} else if loadedState != nil {
+			log.Info("Game state loaded from storage")
+			// Restore world and players (simplified)
+			// In a full implementation, we would replace world and players.
+			// For now, we just log.
+		}
+	}
+
+	// Create managers
+	building := building.NewManager()
+	citizen := citizen.NewManager()
+	combat := combat.NewCombatManager(world)
+	economy := economy.NewEconomyManager()
+	research := research.NewResearchManager(eventBus)
+
+	// Create QuestManager with a reward handler that uses EconomyManager
+	rewardHandler := func(playerID string, resources map[string]int) error {
+		// TODO: integrate with EconomyManager to add resources
+		log.Info("Quest reward", "player", playerID, "resources", resources)
+		return nil
+	}
+	questManager := events.NewQuestManager(eventBus, rewardHandler)
+	// Register some example quests (optional)
+	// questManager.RegisterQuest(...)
+	_ = questManager // suppress unused variable warning
+
+	// Create UI renderer and viewport with larger size for 1600x900 terminal
+	mapWidth := 150
+	mapHeight := 35
+	viewport := ui.NewViewport(cfg.Game.WorldWidth, cfg.Game.WorldHeight, mapWidth, mapHeight)
+	renderer := ui.NewANSIRenderer(viewport, mapWidth)
+	// Enable frame with title
+	renderer.EnableFrame("SSH Arena")
+	// Pass managers to renderer so it can fetch live data
+	renderer.SetManagers(world, building, citizen, combat, economy, research)
 
 	// Create game engine
+	saveInterval := time.Duration(cfg.Server.SaveInterval) * time.Second
 	game := engine.NewGame(
 		world,
 		building,
@@ -85,7 +117,21 @@ func main() {
 		eventBus,
 		storage,
 		time.Duration(cfg.Server.TickRate)*time.Millisecond,
+		saveInterval,
 	)
+
+	// Create network transport (SSH server) with callback to add players
+	networkTransport, err := network.NewSSHTransport(func(playerID string) {
+		if err := game.AddPlayer(playerID); err != nil {
+			log.Warn("Failed to add player", "player", playerID, "error", err)
+		} else {
+			log.Info("Player added via SSH connection", "player", playerID)
+		}
+	})
+	if err != nil {
+		log.Error("Failed to create network transport", "error", err)
+		os.Exit(1)
+	}
 
 	// Start game engine
 	ctx, cancel := context.WithCancel(context.Background())
@@ -130,16 +176,38 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				// Для каждого игрока рендерим кадр и отправляем
-				// TODO: получить список игроков из game
-				// Временно просто отправляем тестовый кадр
-				frame, err := renderer.Render("test", internal.Viewport{})
+				// Получаем состояние игры, чтобы получить список игроков
+				state, err := game.GetState("") // GetState требует playerID, но мы можем использовать пустой или первого игрока
 				if err != nil {
-					log.Warn("Failed to render frame", "error", err)
+					// Если нет игроков, отправляем тестовый кадр
+					frame, err := renderer.Render("test", internal.Viewport{})
+					if err != nil {
+						log.Warn("Failed to render frame", "error", err)
+						continue
+					}
+					networkTransport.Broadcast(frame)
 					continue
 				}
-				// Отправляем всем клиентам
-				networkTransport.Broadcast(frame)
+				// Для каждого игрока рендерим кадр
+				for playerID, player := range state.Players {
+					// Центрируем вьюпорт на игроке
+					viewport.CenterOn(player.Location.X, player.Location.Y)
+					// Рендерим
+					frame, err := renderer.Render(playerID, internal.Viewport{
+						X:      viewport.X,
+						Y:      viewport.Y,
+						Width:  viewport.Width,
+						Height: viewport.Height,
+					})
+					if err != nil {
+						log.Warn("Failed to render frame for player", "player", playerID, "error", err)
+						continue
+					}
+					// Отправляем только этому игроку
+					if err := networkTransport.Send(playerID, frame); err != nil {
+						log.Warn("Failed to send frame to player", "player", playerID, "error", err)
+					}
+				}
 			}
 		}
 	}()
@@ -162,6 +230,13 @@ func main() {
 	if networkTransport != nil {
 		if err := networkTransport.Stop(); err != nil {
 			log.Error("Error stopping network transport", "error", err)
+		}
+	}
+
+	// Close storage
+	if storage != nil {
+		if err := storage.Close(); err != nil {
+			log.Error("Error closing storage", "error", err)
 		}
 	}
 

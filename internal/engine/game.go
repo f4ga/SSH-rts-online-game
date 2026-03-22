@@ -3,6 +3,7 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -40,6 +41,8 @@ type Game struct {
 
 	tickInterval time.Duration
 	ticker       *time.Ticker
+	saveInterval time.Duration
+	saveTicker   *time.Ticker
 	stopChan     chan struct{}
 	running      bool
 
@@ -57,9 +60,13 @@ func NewGame(
 	events internal.EventBus,
 	storage internal.Storage,
 	tickInterval time.Duration,
+	saveInterval time.Duration,
 ) *Game {
 	if tickInterval <= 0 {
 		tickInterval = DefaultTickInterval
+	}
+	if saveInterval <= 0 {
+		saveInterval = 5 * time.Minute // default auto-save interval
 	}
 	return &Game{
 		world:        world,
@@ -75,6 +82,7 @@ func NewGame(
 		ctx:          nil,
 		cancel:       nil,
 		tickInterval: tickInterval,
+		saveInterval: saveInterval,
 		stopChan:     make(chan struct{}),
 		log:          logger.Get(),
 	}
@@ -89,11 +97,13 @@ func (g *Game) Start(ctx context.Context) error {
 	}
 	g.running = true
 	g.ticker = time.NewTicker(g.tickInterval)
+	g.saveTicker = time.NewTicker(g.saveInterval)
 	g.mu.Unlock()
 
-	g.log.Info("game engine started", "tick_interval", g.tickInterval)
+	g.log.Info("game engine started", "tick_interval", g.tickInterval, "save_interval", g.saveInterval)
 
 	go g.loop(ctx)
+	go g.autoSaveLoop(ctx)
 	return nil
 }
 
@@ -107,6 +117,9 @@ func (g *Game) Stop(ctx context.Context) error {
 	g.running = false
 	if g.ticker != nil {
 		g.ticker.Stop()
+	}
+	if g.saveTicker != nil {
+		g.saveTicker.Stop()
 	}
 	close(g.stopChan)
 	g.mu.Unlock()
@@ -243,6 +256,23 @@ func (g *Game) loop(ctx context.Context) {
 	}
 }
 
+// autoSaveLoop periodically saves the game state.
+func (g *Game) autoSaveLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			g.log.Info("auto-save loop cancelled via context")
+			return
+		case <-g.saveTicker.C:
+			if err := g.saveState(); err != nil {
+				g.log.Error("auto-save failed", "error", err)
+			} else {
+				g.log.Debug("game state auto-saved")
+			}
+		}
+	}
+}
+
 // processCommandAsync processes a command received from the command channel.
 func (g *Game) processCommandAsync(playerID string, cmd internal.Command) {
 	g.log.Debug("processing async command", "player", playerID, "command", cmd.Type)
@@ -255,9 +285,47 @@ func (g *Game) processCommandAsync(playerID string, cmd internal.Command) {
 }
 
 func (g *Game) handleBuildCommand(player *internal.Player, cmd internal.Command) (internal.Response, error) {
-	// Simplified implementation
-	g.log.Info("build command", "player", player.ID, "payload", cmd.Payload)
-	return internal.Response{Success: true, Message: "building queued"}, nil
+	// Ожидаем формат: /build <blueprint> <x> <y>
+	blueprint, ok := cmd.Payload["arg0"].(string)
+	if !ok {
+		return internal.Response{Success: false, Message: "missing blueprint type"}, errors.InvalidInput("blueprint")
+	}
+	xStr, ok := cmd.Payload["arg1"].(string)
+	if !ok {
+		return internal.Response{Success: false, Message: "missing X coordinate"}, errors.InvalidInput("x")
+	}
+	yStr, ok := cmd.Payload["arg2"].(string)
+	if !ok {
+		return internal.Response{Success: false, Message: "missing Y coordinate"}, errors.InvalidInput("y")
+	}
+	var x, y int
+	if _, err := fmt.Sscanf(xStr, "%d", &x); err != nil {
+		return internal.Response{Success: false, Message: "invalid X coordinate"}, errors.InvalidInput("x")
+	}
+	if _, err := fmt.Sscanf(yStr, "%d", &y); err != nil {
+		return internal.Response{Success: false, Message: "invalid Y coordinate"}, errors.InvalidInput("y")
+	}
+
+	// Проверяем, что клетка свободна (упрощённо, можно добавить проверку через world)
+	// Пока просто строим.
+
+	building, err := g.building.Construct(player.ID, blueprint, x, y)
+	if err != nil {
+		g.log.Error("failed to construct building", "player", player.ID, "error", err)
+		return internal.Response{Success: false, Message: "construction failed: " + err.Error()}, err
+	}
+
+	// Публикуем событие о постройке
+	if g.events != nil {
+		g.events.Publish(internal.Event{
+			Type:      "building_built",
+			Timestamp: time.Now(),
+			Payload:   building,
+		})
+	}
+
+	g.log.Info("building constructed", "player", player.ID, "blueprint", blueprint, "x", x, "y", y)
+	return internal.Response{Success: true, Message: fmt.Sprintf("Building %s constructed at (%d,%d)", blueprint, x, y)}, nil
 }
 
 func (g *Game) handleMoveCommand(player *internal.Player, cmd internal.Command) (internal.Response, error) {
@@ -276,7 +344,48 @@ func (g *Game) handleResearchCommand(player *internal.Player, cmd internal.Comma
 }
 
 func (g *Game) saveState() error {
-	// TODO: implement proper serialization
-	g.log.Debug("saving game state")
+	if g.storage == nil {
+		g.log.Warn("storage not available, skip saving")
+		return nil
+	}
+	g.mu.RLock()
+	// Create a snapshot of the game state.
+	// For now, we only save world and players; other entities should be added later.
+	state := &internal.GameState{
+		World:     g.world,
+		Players:   g.players,
+		Timestamp: time.Now(),
+	}
+	g.mu.RUnlock()
+
+	if err := g.storage.SaveGame(state); err != nil {
+		return fmt.Errorf("failed to save game state: %w", err)
+	}
+	g.log.Debug("game state saved")
+	return nil
+}
+
+// AddPlayer creates a new player with the given ID and adds them to the game.
+func (g *Game) AddPlayer(playerID string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if _, exists := g.players[playerID]; exists {
+		return errors.New(errors.ErrCodeConflict, "player already exists")
+	}
+
+	// Determine a starting location (e.g., near the center of the world)
+	// For simplicity, we place the player at (0,0) for now.
+	g.players[playerID] = &internal.Player{
+		ID:   playerID,
+		Name: playerID,
+		Location: struct{ X, Y int }{
+			X: 0,
+			Y: 0,
+		},
+		Credits: 1000, // starting resources
+	}
+
+	g.log.Info("player added", "player", playerID)
 	return nil
 }

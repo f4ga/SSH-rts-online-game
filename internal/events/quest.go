@@ -4,6 +4,7 @@ import (
 	"sync"
 
 	"ssh-arena-app/internal"
+	"ssh-arena-app/pkg/logger"
 )
 
 // Quest представляет квест в игре.
@@ -15,20 +16,30 @@ type Quest interface {
 	GetReward() map[string]int // resource type -> amount
 }
 
+// RewardHandler определяет функцию, которая выдает награду игроку.
+type RewardHandler func(playerID string, resources map[string]int) error
+
 // QuestManager управляет квестами игроков.
 type QuestManager struct {
-	mu      sync.RWMutex
-	quests  map[string]Quest                    // все квесты по ID
-	active  map[string]map[string]bool          // playerID -> set of quest IDs
-	bus     internal.EventBus
+	mu            sync.RWMutex
+	quests        map[string]Quest                    // все квесты по ID
+	active        map[string]map[string]bool          // playerID -> set of quest IDs
+	bus           internal.EventBus
+	rewardHandler RewardHandler
+	log           logger.Logger
 }
 
 // NewQuestManager создаёт новый менеджер квестов.
-func NewQuestManager(bus internal.EventBus) *QuestManager {
+func NewQuestManager(bus internal.EventBus, rewardHandler RewardHandler) *QuestManager {
+	if rewardHandler == nil {
+		rewardHandler = defaultRewardHandler
+	}
 	return &QuestManager{
-		quests: make(map[string]Quest),
-		active: make(map[string]map[string]bool),
-		bus:    bus,
+		quests:        make(map[string]Quest),
+		active:        make(map[string]map[string]bool),
+		bus:           bus,
+		rewardHandler: rewardHandler,
+		log:           logger.Get(),
 	}
 }
 
@@ -50,6 +61,7 @@ func (qm *QuestManager) ActivateQuest(playerID, questID string) bool {
 		qm.active[playerID] = make(map[string]bool)
 	}
 	qm.active[playerID][questID] = true
+	qm.bus.Publish(NewQuestStarted(playerID, questID))
 	return true
 }
 
@@ -81,10 +93,15 @@ func (qm *QuestManager) completeQuest(playerID string, quest Quest) {
 	delete(qm.active[playerID], quest.ID())
 	qm.mu.Unlock()
 
-	// Выдать награду (здесь должна быть интеграция с EconomyManager)
-	// Пока просто логируем.
-	_ = quest.GetReward() // награда пока не используется
-	// TODO: добавить ресурсы игроку через EconomyManager.
+	// Выдать награду через обработчик
+	reward := quest.GetReward()
+	if len(reward) > 0 {
+		if err := qm.rewardHandler(playerID, reward); err != nil {
+			qm.log.Error("failed to reward player", "player", playerID, "quest", quest.ID(), "error", err)
+		} else {
+			qm.log.Info("quest reward granted", "player", playerID, "quest", quest.ID(), "reward", reward)
+		}
+	}
 
 	// Опубликовать событие завершения квеста.
 	qm.bus.Publish(NewQuestCompleted(playerID, quest.ID()))
@@ -101,6 +118,13 @@ func (qm *QuestManager) GetActiveQuests(playerID string) []Quest {
 		}
 	}
 	return result
+}
+
+// defaultRewardHandler логирует награду, но не выдаёт её.
+// В реальном приложении должен быть заменён на интеграцию с EconomyManager.
+func defaultRewardHandler(playerID string, resources map[string]int) error {
+	logger.Get().Info("default reward handler called (no actual reward)", "player", playerID, "resources", resources)
+	return nil
 }
 
 // Пример реализации простого квеста.
