@@ -11,7 +11,7 @@ type Animation struct {
 	ID        string
 	X, Y      int          // позиция в мировых координатах
 	Symbol    rune         // отображаемый символ
-	Color     Color        // цвет
+	Color     ColorRGB     // цвет
 	StartTime time.Time    // время начала
 	Duration  time.Duration // длительность
 }
@@ -72,7 +72,7 @@ func CreateExplosion(x, y int) *Animation {
 		X:         x,
 		Y:         y,
 		Symbol:    '*',
-		Color:     ColorRed,
+		Color:     ColorUnit, // красный
 		StartTime: time.Now(),
 		Duration:  200 * time.Millisecond,
 	}
@@ -85,7 +85,7 @@ func CreateMoveTrail(x, y int) *Animation {
 		X:         x,
 		Y:         y,
 		Symbol:    '.',
-		Color:     ColorCyan,
+		Color:     ColorRGB{0, 255, 255}, // голубой
 		StartTime: time.Now(),
 		Duration:  100 * time.Millisecond,
 	}

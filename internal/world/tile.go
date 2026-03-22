@@ -11,6 +11,7 @@ const (
 	TileTypeWater
 	TileTypeGrass
 	TileTypeStone
+	TileTypeSand
 )
 
 // Biome represents the ecological region of a tile.
