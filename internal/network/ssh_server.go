@@ -12,18 +12,19 @@ import (
 
 // SSHServer реализует internal.NetworkTransport через SSH.
 type SSHServer struct {
-	config     *ssh.ServerConfig
-	listener   net.Listener
-	hub        *Hub
-	cmdChan    chan internal.ClientMessage
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	serverAddr string
+	config      *ssh.ServerConfig
+	listener    net.Listener
+	hub         *Hub
+	cmdChan     chan internal.ClientMessage
+	ctx         context.Context
+	cancel      context.CancelFunc
+	wg          sync.WaitGroup
+	serverAddr  string
+	playerAdder func(playerID string) // вызывается при подключении нового игрока
 }
 
 // NewSSHServer создаёт новый SSH-сервер.
-func NewSSHServer(hostKey ssh.Signer, port int) (*SSHServer, error) {
+func NewSSHServer(hostKey ssh.Signer, port int, playerAdder func(playerID string)) (*SSHServer, error) {
 	config := &ssh.ServerConfig{
 		PublicKeyCallback: func(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 			// Принимаем любой ключ (для демо). В реальности нужно проверять.
@@ -43,12 +44,13 @@ func NewSSHServer(hostKey ssh.Signer, port int) (*SSHServer, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &SSHServer{
-		config:     config,
-		hub:        NewHub(),
-		cmdChan:    make(chan internal.ClientMessage, 100),
-		ctx:        ctx,
-		cancel:     cancel,
-		serverAddr: fmt.Sprintf(":%d", port),
+		config:      config,
+		hub:         NewHub(),
+		cmdChan:     make(chan internal.ClientMessage, 100),
+		ctx:         ctx,
+		cancel:      cancel,
+		serverAddr:  fmt.Sprintf(":%d", port),
+		playerAdder: playerAdder,
 	}, nil
 }
 
@@ -140,6 +142,13 @@ func (s *SSHServer) handleConn(conn net.Conn) {
 	}
 }
 
+// terminalState хранит состояние терминала клиента.
+type terminalState struct {
+	width  int
+	height int
+	// можно добавить флаг raw mode
+}
+
 // handleSession обрабатывает SSH-сессию.
 func (s *SSHServer) handleSession(conn *ssh.ServerConn, channel ssh.Channel, requests <-chan *ssh.Request) {
 	clientID := conn.RemoteAddr().String() // временный ID, лучше использовать fingerprint
@@ -147,15 +156,41 @@ func (s *SSHServer) handleSession(conn *ssh.ServerConn, channel ssh.Channel, req
 	s.hub.Register(clientID, session)
 	defer s.hub.Unregister(clientID)
 
+	// Если задан playerAdder, добавляем игрока в игру.
+	if s.playerAdder != nil {
+		s.playerAdder(clientID)
+	}
+
 	// Отправляем приветственное сообщение.
-	welcome := []byte("Welcome to SSH Arena! Type /help for commands.\r\n")
+	welcome := []byte("Welcome to SSH Arena! Use WASD to move, /help for commands.\r\n")
 	channel.Write(welcome)
+
+	var term terminalState
 
 	// Обрабатываем запросы псевдотерминала.
 	for req := range requests {
-		if req.Type == "shell" {
+		switch req.Type {
+		case "pty-req":
+			// Сохраняем размер терминала (опционально)
+			if len(req.Payload) >= 8 {
+				term.width = int(req.Payload[0])<<24 | int(req.Payload[1])<<16 | int(req.Payload[2])<<8 | int(req.Payload[3])
+				term.height = int(req.Payload[4])<<24 | int(req.Payload[5])<<16 | int(req.Payload[6])<<8 | int(req.Payload[7])
+			}
 			req.Reply(true, nil)
+		case "shell":
+			req.Reply(true, nil)
+			// После shell больше не ожидаем запросов (но могут быть window-change)
 			break
+		case "window-change":
+			// Обновляем размер терминала
+			if len(req.Payload) >= 8 {
+				term.width = int(req.Payload[0])<<24 | int(req.Payload[1])<<16 | int(req.Payload[2])<<8 | int(req.Payload[3])
+				term.height = int(req.Payload[4])<<24 | int(req.Payload[5])<<16 | int(req.Payload[6])<<8 | int(req.Payload[7])
+			}
+			req.Reply(true, nil)
+		default:
+			// Игнорируем другие запросы
+			req.Reply(false, nil)
 		}
 	}
 
@@ -167,12 +202,17 @@ func (s *SSHServer) handleSession(conn *ssh.ServerConn, channel ssh.Channel, req
 			if err != nil {
 				break
 			}
-			cmd := internal.ClientMessage{
+			// Преобразуем ввод с учётом маппинга клавиш
+			transformed := TransformInput(buf[:n])
+			if transformed == "" {
+				continue
+			}
+			clientMsg := internal.ClientMessage{
 				ClientID: clientID,
-				Data:     append([]byte(nil), buf[:n]...),
+				Data:     []byte(transformed),
 			}
 			select {
-			case s.cmdChan <- cmd:
+			case s.cmdChan <- clientMsg:
 			default:
 				// Если канал переполнен, игнорируем.
 			}
